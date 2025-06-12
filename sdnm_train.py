@@ -49,11 +49,6 @@ try:
 except ImportError:
     !pip install lightly
 
-# 检查并安装Kaggle API
-try:
-    import kaggle
-except ImportError:
-    !pip install kaggle
 
 # 自动下载EuroSAT数据集
 def download_eurosat_dataset():
