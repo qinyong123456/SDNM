@@ -43,11 +43,6 @@ def set_seed(seed=42):
 # 设置随机种子
 set_seed(42)
 
-# 检查并安装Lightly库
-try:
-    import lightly
-except ImportError:
-    !pip install lightly
 
 
 # 自动下载EuroSAT数据集
