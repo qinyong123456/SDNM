@@ -3,6 +3,9 @@ import torch
 import torchvision
 from sklearn.cluster import KMeans
 from torch import nn
+from torch.utils.data import DataLoader, random_split
+from torchvision import transforms, datasets
+
 from lightly.loss.memory_bank import MemoryBankModule
 from lightly.models import utils
 from lightly.models.modules.heads import (
@@ -10,122 +13,45 @@ from lightly.models.modules.heads import (
     SMoGProjectionHead,
     SMoGPrototypes,
 )
-from lightly.transforms.smog_transform import SMoGTransform
 from lightly.loss import NTXentLoss
 from typing import Dict, Tuple
+
 from pytorch_lightning import LightningModule
 from torch import Tensor
 from torch.nn import CrossEntropyLoss, Linear, Module
 from torch.optim import SGD
+
 from lightly.models.utils import activate_requires_grad, deactivate_requires_grad
 from lightly.utils.benchmarking.topk import mean_topk_accuracy
 from lightly.utils.scheduler import CosineWarmupScheduler
 from lightly.utils.benchmarking import MetricCallback
 from lightly.utils.dist import print_rank_zero
+
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import DeviceStatsMonitor, LearningRateMonitor
 import numpy as np
-import os
-import shutil
-import random
 
-# 设置随机种子以确保结果可复现
-def set_seed(seed=42):
-    """设置随机种子以确保结果可复现"""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-# 设置随机种子
-set_seed(42)
-
-
-
-# 自动下载EuroSAT数据集
-def download_eurosat_dataset():
-    """自动下载EuroSAT数据集到Kaggle环境"""
-    dataset_path = '/kaggle/input/eurosat-dataset'
-    
-    # 检查数据集是否已存在
-    if os.path.exists(dataset_path):
-        print(f"数据集已存在于 {dataset_path}")
-        return dataset_path
-    
-    print("正在下载EuroSAT数据集...")
-    
-    # 创建输入目录
-    os.makedirs('/kaggle/input', exist_ok=True)
-    
-    # 下载数据集
-    try:
-        # 方法1: 使用Kaggle API命令行工具
-        !kaggle datasets download -d ameroyer/eurosat-dataset -p /kaggle/input/
-        
-        # 解压数据集
-        import zipfile
-        with zipfile.ZipFile('/kaggle/input/eurosat-dataset.zip', 'r') as zip_ref:
-            zip_ref.extractall('/kaggle/input/eurosat-dataset')
-        
-        print("数据集下载和解压完成!")
-        return '/kaggle/input/eurosat-dataset'
-    except Exception as e:
-        print(f"下载数据集时出错: {e}")
-        print("尝试从Kaggle Datasets直接下载...")
-        
-        # 方法2: 使用Kaggle Python库
-        try:
-            from kaggle.api.kaggle_api_extended import KaggleApi
-            api = KaggleApi()
-            api.authenticate()  # 通常在Kaggle环境中已自动认证
-            api.dataset_download_files('ameroyer/eurosat-dataset', path='/kaggle/input', unzip=True)
-            print("数据集下载和解压完成!")
-            return '/kaggle/input/eurosat-dataset'
-        except Exception as e2:
-            print(f"再次尝试下载数据集时出错: {e2}")
-            print("请确保您已在Kaggle设置中启用了Internet访问，并接受了数据集的使用条款")
-            raise
-
-# 检查是否有GPU可用
+# 设置Kaggle环境
 accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-print(f"Using accelerator: {accelerator}")
-devices_num = 1
+devices_num = 1 if accelerator == "gpu" else "auto"
+
 torch.backends.cudnn.benchmark = True
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-# 定义参数类
-class Args:
-    nThreads = 4
-    batch_size = 256
-    input_size = 256
-    feature_dim = 512
-    # 数据集路径将由download_eurosat_dataset函数设置
-    path_to_data = None
-    eval_max_epochs = 50
-    # 添加输出路径
-    output_dir = '/kaggle/working/'
-    # 设置随机种子
-    seed = 42
-
-args = Args()
-
-# 下载数据集
-args.path_to_data = download_eurosat_dataset()
-
-# 定义SMoG模型
 class SMoGModel(nn.Module):
     def __init__(self, backbone):
         super().__init__()
+
         self.backbone = backbone
         self.projection_head = SMoGProjectionHead(512, 2048, 128)
         self.prediction_head = SMoGPredictionHead(128, 2048, 128)
+
         self.backbone_momentum = copy.deepcopy(self.backbone)
         self.projection_head_momentum = copy.deepcopy(self.projection_head)
+
         utils.deactivate_requires_grad(self.backbone_momentum)
         utils.deactivate_requires_grad(self.projection_head_momentum)
+
         self.n_groups = 300
         self.smog = SMoGPrototypes(
             group_features=torch.rand(self.n_groups, 128), beta=0.99
@@ -160,6 +86,78 @@ class SMoGModel(nn.Module):
         encoded = self.projection_head_momentum(features)
         return encoded
 
+# 参数设置
+class Args:
+    nThreads = 4
+    batch_size = 256
+    input_size = 64  # EuroSAT图像大小为64x64
+    feature_dim = 512
+    path_to_data = '/kaggle/input/eurosat-dataset/EuroSAT'  # Kaggle上的路径
+    eval_max_epochs = 50
+
+args = Args()
+
+# 加载EuroSAT数据集
+def load_eurosat_dataset():
+    # 图像归一化参数
+    image_mean = [0.485, 0.456, 0.406]
+    image_std = [0.229, 0.224, 0.225]
+    
+    transform = transforms.Compose([
+        transforms.Resize(args.input_size),
+        transforms.CenterCrop(args.input_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=image_mean, std=image_std)
+    ])
+    
+    # 加载数据集
+    full_dataset = datasets.ImageFolder(args.path_to_data, transform=transform)
+    num_classes = len(full_dataset.classes)
+    
+    # 划分数据集
+    dataset_size = len(full_dataset)
+    train_size = int(0.6 * dataset_size)
+    test_size = int(0.2 * dataset_size)
+    val_size = dataset_size - train_size - test_size
+    
+    train_dataset, test_dataset, val_dataset = random_split(
+        full_dataset, [train_size, test_size, val_size]
+    )
+    
+    print(f"Dataset sizes - Train: {len(train_dataset)}, Test: {len(test_dataset)}, Val: {len(val_dataset)}")
+    print(f"Number of classes: {num_classes}")
+    
+    return train_dataset, test_dataset, val_dataset, num_classes
+
+# 加载数据
+train_dataset, test_dataset, val_dataset, num_classes = load_eurosat_dataset()
+
+# 创建数据加载器
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=args.batch_size,
+    shuffle=True,
+    num_workers=args.nThreads,
+    pin_memory=True,
+    drop_last=True
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=args.batch_size,
+    shuffle=False,
+    num_workers=args.nThreads,
+    pin_memory=True
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=args.batch_size,
+    shuffle=False,
+    num_workers=args.nThreads,
+    pin_memory=True
+)
+
 # 初始化模型
 resnet = torchvision.models.resnet18()
 backbone = torch.nn.Sequential(*list(resnet.children())[:-1])
@@ -167,82 +165,28 @@ model = SMoGModel(backbone)
 memory_bank_size = 300 * args.batch_size
 memory_bank = MemoryBankModule(size=memory_bank_size)
 
-# 移动模型到GPU
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Moving model to {device}")
 model.to(device)
 
-# 数据加载和预处理
-image_mean, image_std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-transform = torchvision.transforms.Compose([
-    torchvision.transforms.Resize(args.input_size),
-    torchvision.transforms.CenterCrop(args.input_size),
-    torchvision.transforms.ToTensor(),
-    torchvision.transforms.Normalize(image_mean, image_std)
-])
-
-# 检查数据路径是否存在
-if not os.path.exists(args.path_to_data):
-    raise FileNotFoundError(f"找不到数据路径: {args.path_to_data}")
-
-print(f"数据集路径: {args.path_to_data}")
-print("数据集中的内容:")
-!ls {args.path_to_data}
-
-# 加载数据集
-rs_data = torchvision.datasets.ImageFolder(args.path_to_data, transform)
-num_classes = len(rs_data.classes)
-print(f"数据集包含 {num_classes} 个类别")
-
-# 设置随机种子以确保数据集划分与原始代码一致
-torch.manual_seed(args.seed)
-
-len_rs_data = len(rs_data)
-num_test = int(0.2 * len_rs_data)
-num_train = int(0.6 * len_rs_data)
-
-# 使用相同的随机种子进行数据集划分
-train_rs_data, test_rs_data = torch.utils.data.random_split(
-    rs_data, 
-    lengths=[num_train, num_test],
-    generator=torch.Generator().manual_seed(args.seed)
-)
-
-print(f"训练集大小: {len(train_rs_data)}")
-print(f"测试集大小: {len(test_rs_data)}")
-
-tr_data_loader = torch.utils.data.DataLoader(
-    train_rs_data,
-    batch_size=args.batch_size,
-    shuffle=True,
-    drop_last=True,
-    num_workers=args.nThreads
-)
-
-# 定义损失函数和优化器
+# 训练参数
 global_criterion = nn.CrossEntropyLoss()
 local_criterion = NTXentLoss()
-
 optimizer = torch.optim.SGD(
     model.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-6
 )
-
-# 训练循环
 global_step = 0
 n_epochs = 30
 noise_factor = 0.5
-model.train()
 
-# 创建输出目录
-os.makedirs(args.output_dir, exist_ok=True)
-
+# 训练循环
 print("Starting Training")
+model.train()
 for epoch in range(n_epochs):
     total_loss = 0
-    for batch_idx, batch in enumerate(tr_data_loader):
-        x0 = batch[0]
+    for batch_idx, batch in enumerate(train_loader):
+        x0, _ = batch  # 忽略标签
         noisy_imgs = x0 + noise_factor * torch.randn(*x0.shape)
-        x1 = np.clip(noisy_imgs, 0., 1.)
+        x1 = torch.clamp(noisy_imgs, 0., 1.)  # 使用torch.clamp替代np.clip
 
         if batch_idx % 2:
             x1, x0 = x0, x1
@@ -276,21 +220,10 @@ for epoch in range(n_epochs):
         global_step += 1
         total_loss += loss.detach()
 
-    avg_loss = total_loss / len(tr_data_loader)
+    avg_loss = total_loss / len(train_loader)
     print(f"epoch: {epoch:>02}, loss: {avg_loss:.5f}")
-    
-    # 每个epoch保存一次模型
-    if (epoch + 1) % 5 == 0:
-        model_path = f"{args.output_dir}/smog_model_epoch_{epoch+1}.pth"
-        torch.save(model.state_dict(), model_path)
-        print(f"模型已保存到: {model_path}")
 
-# 保存最终模型
-final_model_path = f"{args.output_dir}/smog_model_final.pth"
-torch.save(model.state_dict(), final_model_path)
-print(f"最终模型已保存到: {final_model_path}")
-
-# 定义MLP分类器
+# 分类器部分保持不变
 class MLPClassifier(LightningModule):
     def __init__(
         self,
@@ -316,7 +249,6 @@ class MLPClassifier(LightningModule):
             torch.nn.Tanh(),
             torch.nn.Linear(256, num_classes),
         )
-
         self.criterion = CrossEntropyLoss()
 
     def forward(self, images: Tensor) -> Tensor:
@@ -324,7 +256,7 @@ class MLPClassifier(LightningModule):
         return self.classification_head(features)
 
     def shared_step(self, batch, batch_idx) -> Tuple[Tensor, Dict[int, Tensor]]:
-        images, targets = batch[0], batch[1]
+        images, targets = batch
         predictions = self.forward(images)
         loss = self.criterion(predictions, targets)
         _, predicted_labels = predictions.topk(max(self.topk))
@@ -335,9 +267,7 @@ class MLPClassifier(LightningModule):
         loss, topk = self.shared_step(batch=batch, batch_idx=batch_idx)
         batch_size = len(batch[1])
         log_dict = {f"train_top{k}": acc for k, acc in topk.items()}
-        self.log(
-            "train_loss", loss, batch_size=batch_size
-        )
+        self.log("train_loss", loss, batch_size=batch_size)
         self.log_dict(log_dict, sync_dist=True, batch_size=batch_size)
         return loss
 
@@ -369,91 +299,42 @@ class MLPClassifier(LightningModule):
         }
         return [optimizer], [scheduler]
 
-# 定义评估函数
-def MLP_eval(model, batch_size, num_workers, accelerator, devices, num_classes, linear_tr_loader, linear_te_loader, ft_max_epochs):
+# 评估函数
+def evaluate_model(model, train_loader, val_loader):
     metric_callback = MetricCallback()
     trainer = pl.Trainer(
-        max_epochs=ft_max_epochs,
+        max_epochs=args.eval_max_epochs,
         accelerator=accelerator,
-        devices=devices,
+        devices=devices_num,
         callbacks=[
             LearningRateMonitor(),
             DeviceStatsMonitor(),
             metric_callback,
         ],
     )
+    
     classifier = MLPClassifier(
         model=model,
-        batch_size=batch_size,
+        batch_size=args.batch_size,
         feature_dim=args.feature_dim,
         num_classes=num_classes,
         freeze_model=False,
     )
+    
     trainer.fit(
         model=classifier,
-        train_dataloaders=linear_tr_loader,
-        val_dataloaders=linear_te_loader,
+        train_dataloaders=train_loader,
+        val_dataloaders=val_loader,
     )
-
+    
     for metric in ["val_top1", "val_top5"]:
         print_rank_zero(
             f"max classification {metric}: {max(metric_callback.val_metrics[metric])}"
         )
-
+    
     return trainer.logged_metrics
 
-# 定义创建评估数据加载器的函数
-def create_data_loader_eval(input_size, batch_size, num_workers):
-    _transform = torchvision.transforms.Compose([
-        torchvision.transforms.Resize(input_size),
-        torchvision.transforms.CenterCrop(input_size),
-        torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize(image_mean, image_std)
-    ])
-
-    # 重新加载数据集并使用相同的随机种子进行划分
-    rs_data_set = torchvision.datasets.ImageFolder(args.path_to_data, transform=_transform)
-    
-    # 确保使用相同的随机种子
-    torch.manual_seed(args.seed)
-    
-    len_rs_data = len(rs_data_set)
-    num_test = int(0.2 * len_rs_data)
-    num_train = int(0.6 * len_rs_data)
-
-    train_rs_data, test_rs_data = torch.utils.data.random_split(
-        rs_data_set, 
-        lengths=[num_train, num_test],
-        generator=torch.Generator().manual_seed(args.seed)
-    )
-
-    rs_train_loader = torch.utils.data.DataLoader(
-        train_rs_data,
-        batch_size=batch_size,
-        num_workers=num_workers,
-    )
-
-    rs_test_loader = torch.utils.data.DataLoader(
-        test_rs_data,
-        batch_size=batch_size,
-        num_workers=num_workers,
-    )
-
-    return rs_train_loader, rs_test_loader
-
-# 创建评估数据加载器
-rs_train_loader, rs_test_loader = create_data_loader_eval(args.input_size, args.batch_size, args.nThreads)
-
-# 评估模型
-print("Starting model evaluation...")
+# 运行评估
 model.eval()
-logged_metrics = MLP_eval(model, args.batch_size, args.nThreads, accelerator, devices_num, num_classes, rs_train_loader,
-                          rs_test_loader, args.eval_max_epochs)
+logged_metrics = evaluate_model(model, train_loader, val_loader)
 print(logged_metrics)
-
-# 保存评估结果
-import json
-results_path = f"{args.output_dir}/evaluation_results.json"
-with open(results_path, 'w') as f:
-    json.dump({k: v.item() if isinstance(v, torch.Tensor) else v for k, v in logged_metrics.items()}, f)
-print(f"评估结果已保存到: {results_path}")
